@@ -1,9 +1,9 @@
-name: probe
+name: probe-mac
 on:
   push:
   workflow_dispatch:
 jobs:
   t:
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     steps:
-      - run: echo ok
+      - run: sw_vers
