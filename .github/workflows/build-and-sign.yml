@@ -25,7 +25,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 45
     env:
       SIGN_MODE: ${{ github.event.inputs.sign_mode || 'unsigned' }}
