@@ -1,0 +1,215 @@
+name: Build & Sign IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      sign_mode:
+        description: "签名方式"
+        type: choice
+        default: auto_asc
+        options:
+          - auto_asc
+          - p12
+          - trollstore
+          - unsigned
+      export_method:
+        description: "导出方式（auto_asc / p12 生效）"
+        type: choice
+        default: development
+        options:
+          - development
+          - ad-hoc
+          - app-store
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      SIGN_MODE: ${{ github.event.inputs.sign_mode || 'unsigned' }}
+      EXPORT_METHOD: ${{ github.event.inputs.export_method || 'development' }}
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      HAS_ASC: ${{ secrets.ASC_KEY_ID != '' && secrets.ASC_KEY_CONTENT != '' }}
+      HAS_P12: ${{ secrets.BUILD_CERTIFICATE_BASE64 != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          brew install xcodegen
+          xcodegen generate
+
+      # ---------- 路线 1：App Store Connect API Key，全自动 ----------
+      - name: Install ASC API key
+        if: env.SIGN_MODE == 'auto_asc' && env.HAS_ASC == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_KEY_CONTENT: ${{ secrets.ASC_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/private_keys"
+          printf '%s' "$ASC_KEY_CONTENT" > "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          echo "key file:"
+          wc -c "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+      # ---------- 路线 2：手动 p12 + 描述文件 ----------
+      - name: Install certificate and profile
+        if: env.SIGN_MODE == 'p12' && env.HAS_P12 == 'true'
+        env:
+          P12_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          echo -n "$P12_BASE64" | base64 --decode -o "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          if [ -n "${PROFILE_BASE64:-}" ]; then
+            PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
+            echo -n "$PROFILE_BASE64" | base64 --decode -o "$PROFILE_PATH"
+            mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+            cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/"
+          fi
+
+      # ---------- 编译归档 ----------
+      - name: Archive
+        run: |
+          set -euo pipefail
+          ARGS=(
+            -project CopyReader.xcodeproj
+            -scheme CopyReader
+            -configuration Release
+            -destination 'generic/platform=iOS'
+            -archivePath build/CopyReader.xcarchive
+            archive
+            CODE_SIGN_STYLE=Automatic
+          )
+          if [ "$SIGN_MODE" = "auto_asc" ] && [ "$HAS_ASC" = "true" ]; then
+            ARGS+=(
+              -allowProvisioningUpdates
+              -authenticationKeyPath "$HOME/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8"
+              -authenticationKeyID "${{ secrets.ASC_KEY_ID }}"
+              -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}"
+              DEVELOPMENT_TEAM="$TEAM_ID"
+            )
+          elif [ "$SIGN_MODE" = "p12" ] && [ "$HAS_P12" = "true" ]; then
+            ARGS+=(
+              DEVELOPMENT_TEAM="$TEAM_ID"
+              CODE_SIGN_IDENTITY="Apple Development"
+            )
+          else
+            ARGS+=(
+              CODE_SIGNING_ALLOWED=NO
+              CODE_SIGNING_REQUIRED=NO
+              CODE_SIGN_IDENTITY=""
+            )
+          fi
+          xcodebuild "${ARGS[@]}" | tail -n 80
+
+      # ---------- 导出已签名 IPA ----------
+      - name: Export signed IPA
+        if: env.SIGN_MODE == 'auto_asc' || env.SIGN_MODE == 'p12'
+        run: |
+          set -euo pipefail
+          mkdir -p build
+
+          SIGNING_STYLE="automatic"
+          EXTRA_KEYS=""
+          EFFECTIVE_TEAM="$TEAM_ID"
+
+          if [ "$SIGN_MODE" = "p12" ]; then
+            SIGNING_STYLE="manual"
+            PROFILE_FILE=$(ls "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision 2>/dev/null | head -1 || true)
+            if [ -z "${PROFILE_FILE:-}" ]; then
+              echo "p12 模式必须有描述文件：BUILD_PROVISION_PROFILE_BASE64"; exit 1
+            fi
+            security cms -D -i "$PROFILE_FILE" > /tmp/pp.plist
+            PP_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" /tmp/pp.plist)
+            PP_TEAM=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" /tmp/pp.plist)
+            EFFECTIVE_TEAM="$PP_TEAM"
+            echo "profile: $PP_NAME / team: $PP_TEAM"
+            EXTRA_KEYS="<key>provisioningProfiles</key><dict><key>com.local.copyreader</key><string>${PP_NAME}</string></dict>"
+          fi
+
+          if [ -z "${EFFECTIVE_TEAM:-}" ]; then echo "缺 APPLE_TEAM_ID"; exit 1; fi
+
+          cat > build/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>${EXPORT_METHOD}</string>
+            <key>teamID</key><string>${EFFECTIVE_TEAM}</string>
+            <key>signingStyle</key><string>${SIGNING_STYLE}</string>
+            <key>stripSwiftSymbols</key><true/>
+            <key>compileBitcode</key><false/>
+            <key>destination</key><string>export</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            ${EXTRA_KEYS}
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint build/ExportOptions.plist
+
+          EXP_ARGS=(
+            -exportArchive
+            -archivePath build/CopyReader.xcarchive
+            -exportPath build/export
+            -exportOptionsPlist build/ExportOptions.plist
+          )
+          if [ "$SIGN_MODE" = "auto_asc" ] && [ "$HAS_ASC" = "true" ]; then
+            EXP_ARGS+=(
+              -allowProvisioningUpdates
+              -authenticationKeyPath "$HOME/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8"
+              -authenticationKeyID "${{ secrets.ASC_KEY_ID }}"
+              -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}"
+            )
+          fi
+          xcodebuild "${EXP_ARGS[@]}"
+          ls -lh build/export
+          cp build/export/CopyReader.ipa "build/CopyReader-${SIGN_MODE}-${EXPORT_METHOD}.ipa"
+
+      # ---------- TrollStore 伪签名（iOS 14–17.0，免账号） ----------
+      - name: TrollStore ldid sign
+        if: env.SIGN_MODE == 'trollstore'
+        run: |
+          set -euo pipefail
+          brew install ldid
+          mkdir -p build/Payload
+          cp -R build/CopyReader.xcarchive/Products/Applications/CopyReader.app build/Payload/
+          ldid -STrollStore.entitlements build/Payload/CopyReader.app/CopyReader
+          codesign -d --entitlements :- build/Payload/CopyReader.app/CopyReader || true
+          cd build && zip -qry CopyReader-trollstore.ipa Payload
+          ls -lh CopyReader-trollstore.ipa
+
+      # ---------- 未签名兜底 ----------
+      - name: Package unsigned IPA
+        if: env.SIGN_MODE == 'unsigned'
+        run: |
+          set -euo pipefail
+          mkdir -p build/Payload
+          cp -R build/CopyReader.xcarchive/Products/Applications/CopyReader.app build/Payload/
+          cd build && zip -qry CopyReader-unsigned.ipa Payload
+          ls -lh CopyReader-unsigned.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CopyReader-${{ env.SIGN_MODE }}
+          path: build/*.ipa
+          if-no-files-found: error
+          retention-days: 30
