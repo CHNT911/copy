@@ -5,8 +5,13 @@ struct RootView: View {
     @StateObject private var library = LibraryStore()
     @StateObject private var saver = ImageSaver()
 
+    @Environment(\.horizontalSizeClass) private var hSize
+
     @State private var showLibrary = false
     @State private var showSettings = false
+    @State private var sidebarOn = true
+
+    private var isPad: Bool { hSize == .regular }
 
     private var hostLabel: String {
         if model.urlString.contains("copy4000.com") { return "鏡像" }
@@ -15,11 +20,13 @@ struct RootView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            content
+        Group {
+            if isPad {
+                padLayout
+            } else {
+                phoneLayout
+            }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) { footer }
         .onAppear { model.prepare() }
         .onChange(of: model.urlString) { newValue in
             library.record(title: model.pageTitle, url: newValue)
@@ -32,9 +39,120 @@ struct RootView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView(model: model)
         }
+        .overlay(alignment: .bottom) { saveBanner }
     }
 
-    private var header: some View {
+    // MARK: - iPad 分栏
+
+    private var padLayout: some View {
+        HStack(spacing: 0) {
+            if sidebarOn {
+                SidebarView(library: library, model: model, hostLabel: hostLabel) { link in
+                    if let url = URL(string: link) { model.load(url, force: true) }
+                }
+                .frame(width: 300)
+                .background(Color(.secondarySystemBackground))
+                .transition(.move(edge: .leading))
+                Divider()
+            }
+
+            VStack(spacing: 0) {
+                padBar
+                Divider()
+                webArea
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private var padBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.22)) { sidebarOn.toggle() }
+            } label: {
+                Image(systemName: sidebarOn ? "sidebar.left" : "sidebar.leading")
+                    .font(.system(size: 17))
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
+            }
+            .keyboardShortcut("s", modifiers: [.command, .option])
+
+            Text(model.pageTitle)
+                .font(.headline)
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            Spacer(minLength: 12)
+
+            Button { model.toggleMirror() } label: {
+                Text(hostLabel)
+                    .font(.system(size: 11, weight: .medium))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Color.secondary.opacity(0.14), in: Capsule())
+            }
+            .buttonStyle(.plain)
+
+            padIcon("chevron.left", enabled: model.canGoBack) { model.webView?.goBack() }
+                .keyboardShortcut("[", modifiers: .command)
+            padIcon("chevron.right", enabled: model.canGoForward) { model.webView?.goForward() }
+                .keyboardShortcut("]", modifiers: .command)
+            padIcon("arrow.clockwise") { model.reload() }
+                .keyboardShortcut("r", modifiers: .command)
+            padIcon("square.and.arrow.down") { savePageImages() }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+            padIcon("bookmark") {
+                let added = library.toggleBookmark(title: model.pageTitle, url: model.urlString)
+                model.showBanner(added ? "已加入書籤" : "已取消書籤")
+            }
+            .keyboardShortcut("d", modifiers: .command)
+
+            Menu {
+                Button { model.goHome() } label: { Label("回首頁", systemImage: "house") }
+                Button { savePageImages() } label: { Label("保存本頁圖片", systemImage: "square.and.arrow.down") }
+                Button {
+                    model.setDesktop(!model.isDesktop)
+                    model.showBanner(model.isDesktop ? "電腦版" : "手機版")
+                } label: {
+                    Label(model.isDesktop ? "切換手機版" : "切換電腦版", systemImage: "desktopcomputer")
+                }
+                Button { model.toggleMirror() } label: { Label("切換線路", systemImage: "arrow.triangle.2.circlepath") }
+                Divider()
+                Button { showSettings = true } label: { Label("設定", systemImage: "gearshape") }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 18))
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 50)
+        .background(.bar)
+    }
+
+    private func padIcon(_ symbol: String, enabled: Bool = true, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 16))
+                .frame(width: 34, height: 34)
+                .contentShape(Rectangle())
+        }
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.28)
+    }
+
+    // MARK: - iPhone 单栏
+
+    private var phoneLayout: some View {
+        VStack(spacing: 0) {
+            phoneHeader
+            webArea
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) { phoneFooter }
+    }
+
+    private var phoneHeader: some View {
         HStack(spacing: 8) {
             Image(systemName: "book.closed.fill")
                 .font(.system(size: 11))
@@ -59,34 +177,7 @@ struct RootView: View {
         .background(Color(.systemBackground))
     }
 
-    private var content: some View {
-        ZStack(alignment: .top) {
-            if model.isReady {
-                WebViewContainer(model: model)
-            } else {
-                ProgressView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color(.systemBackground))
-            }
-
-            if model.isLoading && model.progress < 1 {
-                ProgressView(value: max(0.03, model.progress))
-                    .progressViewStyle(.linear)
-                    .frame(height: 2)
-            }
-
-            if let banner = model.banner {
-                Text(banner)
-                    .font(.footnote)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 7)
-                    .background(Color(.secondarySystemBackground), in: Capsule())
-                    .padding(.top, 10)
-            }
-        }
-    }
-
-    private var footer: some View {
+    private var phoneFooter: some View {
         HStack(spacing: 0) {
             barButton("chevron.left", enabled: model.canGoBack) { model.webView?.goBack() }
             barButton("chevron.right", enabled: model.canGoForward) { model.webView?.goForward() }
@@ -121,25 +212,8 @@ struct RootView: View {
             }
         }
         .padding(.horizontal, 2)
-        .background(Color(.systemBackground))
+        .background(.bar)
         .overlay(alignment: .top) { Divider() }
-        .overlay(alignment: .bottom) {
-            if saver.saving {
-                Text("保存中 \(saver.saved)/\(saver.total)")
-                    .font(.footnote)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(Color(.secondarySystemBackground), in: Capsule())
-                    .padding(.bottom, 58)
-            } else if let message = saver.message {
-                Text(message)
-                    .font(.footnote)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(Color(.secondarySystemBackground), in: Capsule())
-                    .padding(.bottom, 58)
-            }
-        }
     }
 
     private func barButton(_ symbol: String, enabled: Bool = true, action: @escaping () -> Void) -> some View {
@@ -153,6 +227,56 @@ struct RootView: View {
         .opacity(enabled ? 1 : 0.28)
     }
 
+    // MARK: - 共用
+
+    private var webArea: some View {
+        ZStack(alignment: .top) {
+            if model.isReady {
+                WebViewContainer(model: model)
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(.systemBackground))
+            }
+
+            if model.isLoading && model.progress < 1 {
+                ProgressView(value: max(0.03, model.progress))
+                    .progressViewStyle(.linear)
+                    .frame(height: 2)
+            }
+
+            if let banner = model.banner {
+                Text(banner)
+                    .font(.footnote)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.top, 10)
+                    .transition(.opacity)
+            }
+        }
+    }
+
+    private var saveBanner: some View {
+        Group {
+            if saver.saving {
+                Text("保存中 \(saver.saved)/\(saver.total)")
+                    .font(.footnote)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.bottom, isPad ? 24 : 66)
+            } else if let message = saver.message {
+                Text(message)
+                    .font(.footnote)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.bottom, isPad ? 24 : 66)
+            }
+        }
+    }
+
     private func savePageImages() {
         let referer = model.urlString
         let ua = model.userAgent()
@@ -161,6 +285,118 @@ struct RootView: View {
         }
     }
 }
+
+// MARK: - iPad 侧栏
+
+struct SidebarView: View {
+    @ObservedObject var library: LibraryStore
+    @ObservedObject var model: AppModel
+    let hostLabel: String
+    let onOpen: (String) -> Void
+
+    @State private var tab = 0
+
+    private var items: [SavedLink] {
+        tab == 0 ? library.bookmarks : library.history
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 9) {
+                Image(systemName: "book.closed.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(.accentColor)
+                Text("拷貝閱讀器")
+                    .font(.headline)
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 20)
+            .padding(.bottom, 14)
+
+            Picker("", selection: $tab) {
+                Text("書籤").tag(0)
+                Text("最近").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+
+            if items.isEmpty {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Text(tab == 0 ? "还没有書籤" : "还没有閱讀記錄")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                    Text(tab == 0 ? "看到好頁面按 ⌘D 收藏" : "")
+                        .font(.caption2)
+                        .foregroundColor(.secondary.opacity(0.7))
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                List {
+                    ForEach(items) { item in
+                        Button {
+                            onOpen(item.url)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.title)
+                                    .font(.subheadline)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.leading)
+                                Text(item.url)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
+                            .padding(.vertical, 3)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            if tab == 0 {
+                                Button(role: .destructive) {
+                                    library.removeBookmark(id: item.id)
+                                } label: { Label("刪除", systemImage: "trash") }
+                            }
+                        }
+                        .swipeActions {
+                            if tab == 0 {
+                                Button(role: .destructive) {
+                                    library.removeBookmark(id: item.id)
+                                } label: { Label("刪除", systemImage: "trash") }
+                            }
+                        }
+                    }
+                }
+                .listStyle(.plain)
+            }
+
+            Divider()
+
+            HStack(spacing: 14) {
+                Button { model.toggleMirror() } label: {
+                    Label(hostLabel, systemImage: "arrow.triangle.2.circlepath")
+                        .font(.footnote)
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+
+                Button { model.goHome() } label: {
+                    Image(systemName: "house")
+                        .font(.system(size: 15))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+    }
+}
+
+// MARK: - 手机书架
 
 struct LibraryView: View {
     @ObservedObject var library: LibraryStore
@@ -226,6 +462,8 @@ struct LibraryView: View {
     }
 }
 
+// MARK: - 设置
+
 struct SettingsView: View {
     @ObservedObject var model: AppModel
     @Environment(\.dismiss) private var dismiss
@@ -256,10 +494,20 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    shortcutRow("重新載入", "⌘R")
+                    shortcutRow("後退 / 前進", "⌘[ / ⌘]")
+                    shortcutRow("加入書籤", "⌘D")
+                    shortcutRow("保存本頁圖片", "⌘⇧S")
+                    shortcutRow("切換書架", "⌘⌥S")
+                } header: { Text("iPad 快捷鍵") } footer: {
+                    Text("接上鍵盤時可用。")
+                }
+
+                Section {
                     HStack {
                         Text("版本")
                         Spacer()
-                        Text("1.0.0").foregroundColor(.secondary)
+                        Text("1.1.0").foregroundColor(.secondary)
                     }
                     HStack {
                         Text("內核")
@@ -277,6 +525,16 @@ struct SettingsView: View {
                     Button("完成") { dismiss() }
                 }
             }
+        }
+    }
+
+    private func shortcutRow(_ title: String, _ key: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(key)
+                .font(.system(.footnote, design: .monospaced))
+                .foregroundColor(.secondary)
         }
     }
 }
